@@ -1,7 +1,6 @@
-import Foundation
-import SourceKittenFramework
+import SwiftSyntax
 
-public struct RedundantTypeAnnotationRule: OptInRule, SubstitutionCorrectableRule, ConfigurationProviderRule {
+public struct RedundantTypeAnnotationRule: OptInRule, SwiftSyntaxCorrectableRule, ConfigurationProviderRule {
     public var configuration = SeverityConfiguration(.warning)
 
     public static let description = RuleDescription(
@@ -76,96 +75,108 @@ public struct RedundantTypeAnnotationRule: OptInRule, SubstitutionCorrectableRul
         ]
     )
 
-    public func validate(file: SwiftLintFile) -> [StyleViolation] {
-        return violationRanges(in: file).map { range in
-            StyleViolation(
-                ruleDescription: Self.description,
-                severity: configuration.severity,
-                location: Location(file: file, characterOffset: range.location)
-            )
+    public init() {}
+
+    public func makeVisitor(file: SwiftLintFile) -> ViolationsSyntaxVisitor {
+        Visitor(viewMode: .sourceAccurate)
+    }
+
+    public func makeRewriter(file: SwiftLintFile) -> ViolationsSyntaxRewriter? {
+        Rewriter(
+            locationConverter: file.locationConverter,
+            disabledRegions: disabledRegions(file: file)
+        )
+    }
+}
+
+private extension RedundantTypeAnnotationRule {
+    final class Visitor: ViolationsSyntaxVisitor {
+        override func visitPost(_ node: VariableDeclSyntax) {
+            guard !node.isIBInspectable else {
+                return
+            }
+
+            for binding in node.bindings {
+                guard let typeAnnotation = binding.typeAnnotation,
+                      binding.hasViolation else {
+                    continue
+                }
+
+                violations.append(typeAnnotation.colon.positionAfterSkippingLeadingTrivia)
+            }
         }
     }
 
-    public func substitution(for violationRange: NSRange, in file: SwiftLintFile) -> (NSRange, String)? {
-        return (violationRange, "")
-    }
+    private final class Rewriter: SyntaxRewriter, ViolationsSyntaxRewriter {
+        private(set) var correctionPositions: [AbsolutePosition] = []
+        let locationConverter: SourceLocationConverter
+        let disabledRegions: [SourceRange]
 
-    private let typeAnnotationPattern: String
-    private let expressionPattern: String
+        init(locationConverter: SourceLocationConverter, disabledRegions: [SourceRange]) {
+            self.locationConverter = locationConverter
+            self.disabledRegions = disabledRegions
+        }
 
-    public init() {
-        typeAnnotationPattern =
-            ":\\s*" + // semicolon and any number of whitespaces
-            "\\w+"    // type name
-
-        expressionPattern =
-            "(var|let)" + // var or let
-            "\\s+" +      // at least single whitespace
-            "\\w+" +      // variable name
-            "\\s*" +      // possible whitespaces
-            typeAnnotationPattern +
-            "\\s*=\\s*" + // assignment operator with possible surrounding whitespaces
-            "\\w+" +      // assignee name (type or keyword)
-            "[\\(\\.]?"   // possible opening parenthesis or dot
-    }
-
-    public func violationRanges(in file: SwiftLintFile) -> [NSRange] {
-        let violatingRanges = file
-            .match(pattern: expressionPattern)
-            .filter {
-                $0.1 == [.keyword, .identifier, .typeidentifier, .identifier] ||
-                $0.1 == [.keyword, .identifier, .typeidentifier, .keyword]
-            }
-            .filter { !isFalsePositive(file: file, range: $0.0) }
-            .filter { !isIBInspectable(file: file, range: $0.0) }
-            .compactMap {
-                file.match(pattern: typeAnnotationPattern,
-                           excludingSyntaxKinds: SyntaxKind.commentAndStringKinds, range: $0.0).first
+        override func visit(_ node: VariableDeclSyntax) -> DeclSyntax {
+            guard !node.isIBInspectable else {
+                return super.visit(node)
             }
 
-        return violatingRanges
+            var modifiedBindings: [PatternBindingSyntax] = []
+            var hasViolation = false
+
+            for binding in node.bindings {
+                guard let typeAnnotation = binding.typeAnnotation,
+                      !typeAnnotation.isContainedIn(regions: disabledRegions, locationConverter: locationConverter),
+                      binding.hasViolation else {
+                    modifiedBindings.append(binding)
+                    continue
+                }
+
+                correctionPositions.append(typeAnnotation.colon.positionAfterSkippingLeadingTrivia)
+
+                let updatedInitializer = binding.initializer?.withLeadingTrivia(typeAnnotation.trailingTrivia ?? .space)
+                modifiedBindings.append(
+                    binding
+                        .withTypeAnnotation(nil)
+                        .withInitializer(updatedInitializer)
+                )
+                hasViolation = true
+            }
+
+            guard hasViolation else {
+                return super.visit(node)
+            }
+
+            return super.visit(node.withBindings(PatternBindingListSyntax(modifiedBindings)))
+        }
     }
+}
 
-    private func isFalsePositive(file: SwiftLintFile, range: NSRange) -> Bool {
-        guard let typeNames = getPartsOfExpression(in: file, range: range) else { return false }
-
-        let lhs = typeNames.variableTypeName
-        let rhs = typeNames.assigneeName
-
-        if lhs == rhs || (lhs == "Bool" && (rhs == "true" || rhs == "false")) {
+private extension PatternBindingSyntax {
+    var hasViolation: Bool {
+        guard let typeAnnotation = typeAnnotation,
+              let initializer = initializer?.value else {
             return false
-        } else {
-            return true
-        }
-    }
-
-    private func getPartsOfExpression(
-        in file: SwiftLintFile, range: NSRange
-    ) -> (variableTypeName: String, assigneeName: String)? {
-        let substring = file.stringView.substring(with: range)
-        let components = substring.components(separatedBy: "=")
-
-        guard
-            components.count == 2,
-            let variableTypeName = components[0].components(separatedBy: ":").last?.trimmingCharacters(in: .whitespaces)
-        else {
-            return nil
         }
 
-        let charactersToTrimFromRhs = CharacterSet(charactersIn: ".(").union(.whitespaces)
-        let assigneeName = components[1].trimmingCharacters(in: charactersToTrimFromRhs)
+        if let function = initializer.as(FunctionCallExprSyntax.self) {
+            return typeAnnotation.type.withoutTrivia().description ==
+                function.calledExpression.withoutTrivia().description
+        } else if let baseExpr = initializer.as(MemberAccessExprSyntax.self)?.base {
+            return typeAnnotation.type.withoutTrivia().description == baseExpr.withoutTrivia().description
+        } else if typeAnnotation.type.as(SimpleTypeIdentifierSyntax.self)?.name.text == "Bool" {
+            return initializer.is(BooleanLiteralExprSyntax.self)
+        }
 
-        return (variableTypeName, assigneeName)
+        return false
     }
+}
 
-    private func isIBInspectable(file: SwiftLintFile, range: NSRange) -> Bool {
-        guard
-            let byteRange = file.stringView.NSRangeToByteRange(start: range.location, length: range.length),
-            let dict = file.structureDictionary.structures(forByteOffset: byteRange.location).last,
-            let kind = dict.declarationKind,
-            SwiftDeclarationKind.variableKinds.contains(kind)
-        else { return false }
-
-        return dict.enclosedSwiftAttributes.contains(.ibinspectable)
+private extension VariableDeclSyntax {
+    var isIBInspectable: Bool {
+        attributes?.contains { attr in
+            attr.as(AttributeSyntax.self)?.attributeName.text == "IBInspectable"
+        } ?? false
     }
 }
