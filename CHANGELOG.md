@@ -146,6 +146,7 @@
   - `redundant_set_access_control`
   - `redundant_optional_initialization`
   - `redundant_string_enum_value`
+  - `redundant_type_annotation`
   - `required_deinit`
   - `return_arrow_whitespace`
   - `self_in_property_initialization`
